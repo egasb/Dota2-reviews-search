@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+data/*.jsonl
+data/*.npy
+data/*.txt
+!data/.gitkeep
+.env
+
+project_dump.txt
+file.py
