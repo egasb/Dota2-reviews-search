@@ -29,23 +29,21 @@ class LLMQueryGenerator:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         logger.info(f"Loading model weights for {model_name}...")
-        torch_dtype = (
-            torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        )
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
         quantization_config = None
         if settings.load_in_4bit and self.device == "cuda":
             logger.info("NF4 Quantization (4-bit) is enabled.")
             quantization_config = BitsAndBytesConfig(
                 load_in_4bit=True,
-                bnb_4bit_compute_dtype=torch_dtype,
+                bnb_4bit_compute_dtype=dtype,
                 bnb_4bit_quant_type="nf4",
                 bnb_4bit_use_double_quant=True,
             )
 
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
-            torch_dtype=torch_dtype,
+            dtype=dtype,
             device_map="auto" if self.device == "cuda" else None,
             token=hf_token,
             attn_implementation="sdpa" if self.device == "cuda" else None,
@@ -60,19 +58,25 @@ class LLMQueryGenerator:
         self.close()
 
     def _build_prompt(self, review_text: str) -> str:
-        """Construct the system instruction and chat template for a single review."""
+        """Construct the system instruction asking for exactly 3 distinct search queries."""
         messages = [
             {
                 "role": "user",
                 "content": (
                     "Read the following Dota 2 Steam review and formulate "
-                    "ONE short, realistic search query (2 to 5 words) IN RUSSIAN "
-                    "that a user would type to find this specific review.\n"
-                    "The query must capture the key issue of the review "
-                    "(e.g., bug, toxicity, high ping, bad update, emotion).\n\n"
-                    "CRITICAL REQUIREMENT: Output the final query wrapped inside "
-                    "<query> and </query> tags. Example: <query>ваш запрос здесь</query>.\n"
-                    "Do not write any introductory text, notes, or explanation outside the tags.\n\n"
+                    "exactly THREE distinct, realistic search queries IN RUSSIAN "
+                    "that different users might type to find this specific review.\n\n"
+                    "Make the queries diverse:\n"
+                    "1. A short, keyword-based search query (1-3 words).\n"
+                    "2. A natural language question or conversational query (e.g., 'что делать если...').\n"
+                    "3. A slang or context-specific query (using gaming jargon like 'руинить', 'рак', 'пинг').\n\n"
+                    "CRITICAL REQUIREMENT: Output each final query wrapped inside its own "
+                    "<query> and </query> tags. You must output exactly three queries.\n"
+                    "Example format:\n"
+                    "<query>первый запрос</query>\n"
+                    "<query>второй запрос</query>\n"
+                    "<query>третий запрос</query>\n\n"
+                    "Do not write any introductory text, bullet points, or numbers outside the tags.\n\n"
                     f'Review: "{review_text}"'
                 ),
             }
@@ -81,13 +85,15 @@ class LLMQueryGenerator:
             messages, tokenize=False, add_generation_prompt=True
         )
 
-    def _extract_query(self, raw_text: str) -> str | None:
+    def _extract_queries(self, raw_text: str) -> list[str]:
         """Extract a query enclosed in XML-like tags using regular expressions."""
-        match = re.search(r"<query>(.*?)</query>", raw_text, re.DOTALL | re.IGNORECASE)
-        return match.group(1).strip() if match else None
+        matches = re.findall(
+            r"<query>(.*?)</query>", raw_text, re.DOTALL | re.IGNORECASE
+        )
+        return [q.strip() for q in matches if q.strip()]
 
-    def generate_batch(self, reviews: list[Review]) -> list[str | None]:
-        """Perform batched generation for a list of reviews in a single forward pass."""
+    def generate_batch(self, reviews: list[Review]) -> list[list[str]]:
+        """Perform batched generation returning a list of list of queries for each review."""
         prompts = [self._build_prompt(doc["text"]) for doc in reviews]
         inputs = self.tokenizer(
             prompts, return_tensors="pt", padding=True, truncation=True
@@ -96,20 +102,20 @@ class LLMQueryGenerator:
         with torch.no_grad():
             outputs = self.model.generate(  # type: ignore
                 **inputs,
-                max_new_tokens=24,
-                temperature=0.2,
+                max_new_tokens=64,
+                temperature=0.3,
                 do_sample=True,
                 pad_token_id=self.tokenizer.pad_token_id,
             )
 
-        queries: list[str | None] = []
+        queries_batch: list[list[str]] = []
         for idx, _ in enumerate(reviews):
             prompt_len = inputs.input_ids[idx].shape[0]
             generated_tokens = outputs[idx][prompt_len:]
             raw_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
-            queries.append(self._extract_query(raw_text))
+            queries_batch.append(self._extract_queries(raw_text))
 
-        return queries
+        return queries_batch
 
     def close(self) -> None:
         """Explicitly release model from GPU VRAM and run garbage collection."""
@@ -171,10 +177,10 @@ def generate_validation_set() -> None:
             range(0, len(reviews_to_process), batch_size), desc="Generating QGen"
         ):
             batch_docs = reviews_to_process[i : i + batch_size]
-            queries = generator.generate_batch(batch_docs)
+            queries_list = generator.generate_batch(batch_docs)
 
-            for idx, query in enumerate(queries):
-                if query:
+            for idx, queries in enumerate(queries_list):
+                for query in queries:
                     results.append(
                         {
                             "query_id": f"q_{start_q_idx:04d}",

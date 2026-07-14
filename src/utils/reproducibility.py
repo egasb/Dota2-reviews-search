@@ -7,7 +7,6 @@ def set_seed(seed: int = 20260505) -> None:
     except ImportError:
         pass
 
-    # Lazy import of torch
     try:
         import torch
 
