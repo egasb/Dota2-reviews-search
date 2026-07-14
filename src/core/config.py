@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     # Embeddings
     model_name: str = "intfloat/multilingual-e5-small"
-    batch_size: int = 1024
+    batch_size: int = 256
 
     # Paths
     raw_file: Path = DATA_DIR / "raw" / "reviews.jsonl"

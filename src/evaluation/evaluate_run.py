@@ -24,23 +24,23 @@ def evaluate(run_file_path: Path) -> None:
         sys.exit(1)
 
     logger.info("Loading Qrels (Ground Truth)...")
-    qrels = [
-        {
-            "query_id": item["query_id"],
-            "doc_id": item["relevant_doc_id"],
-            "relevance": 1,
-        }
-        for item in read_json(settings.validation_set_file)
-    ]
+
+    qrels = {}
+    for item in read_json(settings.validation_set_file):
+        q_id = str(item["query_id"])
+        d_id = str(item["relevant_doc_id"])
+
+        if q_id not in qrels:
+            qrels[q_id] = {}
+        qrels[q_id][d_id] = 1
 
     logger.info(f"Loading Run (Predictions) from {run_file_path.name}...")
-    run_dict = read_json(run_file_path)
+    raw_run_dict = read_json(run_file_path)
 
-    run = [
-        {"query_id": q_id, "doc_id": doc_id, "score": score}
-        for q_id, docs in run_dict.items()
-        for doc_id, score in docs.items()
-    ]
+    run = {
+        str(q_id): {str(doc_id): float(score) for doc_id, score in docs.items()}
+        for q_id, docs in raw_run_dict.items()
+    }
 
     metrics = [nDCG @ 5, nDCG @ 10, P @ 1, P @ 5, R @ 5, R @ 20, MRR]
 
