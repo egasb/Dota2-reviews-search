@@ -10,7 +10,7 @@ from typing import Optional
 
 from qdrant_client import QdrantClient
 
-from config import settings
+from src.core.config import settings
 
 
 class QdrantClientSingleton:

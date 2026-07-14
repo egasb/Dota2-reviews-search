@@ -22,11 +22,11 @@ import numpy as np
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from adapters.file_adapter import FileAdapter  # noqa: E402
-from adapters.model_adapter import ModelAdapter  # noqa: E402
-from config import settings  # noqa: E402
-from database.collections import ensure_collections, recreate_collections  # noqa: E402
-from database.operations import batch_upsert  # noqa: E402
+from src.adapters.file_adapter import FileAdapter  # noqa: E402
+from src.adapters.model_adapter import ModelAdapter  # noqa: E402
+from src.core.config import settings  # noqa: E402
+from src.database.collections import ensure_collections, recreate_collections  # noqa: E402
+from src.database.operations import batch_upsert  # noqa: E402
 
 
 def iter_jsonl(path: str) -> Iterator[dict]:

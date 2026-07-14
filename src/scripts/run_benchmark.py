@@ -18,9 +18,9 @@ import psutil
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 
-from adapters.model_adapter import ModelAdapter  # noqa: E402
-from config import settings  # noqa: E402
-from database.operations import search as vector_search  # noqa: E402
+from src.adapters.model_adapter import ModelAdapter  # noqa: E402
+from src.core.config import settings  # noqa: E402
+from src.database.operations import search as vector_search  # noqa: E402
 
 SAMPLE_QUERIES = [
     "лучшая игра для игры с друзьями",

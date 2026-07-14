@@ -25,8 +25,8 @@ from qdrant_client.models import (
     VectorParams,
 )
 
-from config import settings
-from database.client import QdrantClientSingleton
+from src.core.config import settings
+from src.database.client import QdrantClientSingleton
 
 
 def _distance_from_config() -> Distance:

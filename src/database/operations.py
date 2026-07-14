@@ -14,8 +14,8 @@ from qdrant_client.models import (
     SearchParams,
 )
 
-from config import settings
-from database.client import QdrantClientSingleton
+from src.core.config import settings
+from src.database.client import QdrantClientSingleton
 
 
 def batch_upsert(

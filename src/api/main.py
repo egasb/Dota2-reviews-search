@@ -11,18 +11,18 @@ import time
 
 from fastapi import FastAPI, HTTPException
 
-from adapters.model_adapter import ModelAdapter
-from api.schemas import (
+from src.adapters.model_adapter import ModelAdapter
+from src.api.schemas import (
     HealthResponse,
     ReviewPayload,
     SearchRequest,
     SearchResponse,
     SearchResultItem,
 )
-from config import settings
-from database.client import QdrantClientSingleton
-from database.collections import ensure_collections
-from database.operations import search as vector_search
+from src.core.config import settings
+from src.database.client import QdrantClientSingleton
+from src.database.collections import ensure_collections
+from src.database.operations import search as vector_search
 
 app = FastAPI(
     title="Dota 2 Reviews Search Engine",
