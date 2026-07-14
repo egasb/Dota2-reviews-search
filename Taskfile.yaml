@@ -1,0 +1,33 @@
+version: "3"
+
+env:
+  PYTHONPATH: .
+
+silent: true
+
+tasks:
+  default:
+    cmds:
+      - task --list
+
+  fetch:
+    desc: "Download raw reviews"
+    cmds:
+      - uv run python src/pipeline/fetch.py
+
+  filter:
+    desc: "Filter spam and garbage"
+    cmds:
+      - uv run python src/pipeline/filter.py
+
+  embed:
+    desc: "Generate embeddings"
+    cmds:
+      - uv run python src/pipeline/embed.py
+
+  run-all:
+    desc: "Run pipeline"
+    cmds:
+      - task fetch
+      - task filter
+      - task embed

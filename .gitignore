@@ -1,8 +1,10 @@
-.venv/
-__pycache__/
-*.pyc
 data
+.venv
 .env
+.vscode
+*.pyc
+__pycache__/
+*.py[cod]
 
 project_dump.txt
 file.py
