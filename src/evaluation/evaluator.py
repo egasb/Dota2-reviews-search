@@ -1,6 +1,5 @@
-# FILE: src/evaluation/evaluator.py
-
 import argparse
+import math
 import random
 import sys
 from pathlib import Path
@@ -13,6 +12,10 @@ import torch.nn.functional as F
 from ir_measures import MRR, nDCG, P, R
 from loguru import logger
 from sentence_transformers import SentenceTransformer
+
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
 
 from src.core.config import settings
 from src.utils.io import read_json, write_json
@@ -33,7 +36,7 @@ def get_single_char() -> str:
 
         try:
             char = msvcrt.getch()
-            if char in (b"\x03", b"\x11"):  # Ctrl+C or Ctrl+Q
+            if char in (b"\x03", b"\x11"):
                 raise KeyboardInterrupt
             return char.decode("utf-8").lower()
         except (UnicodeDecodeError, AttributeError):
@@ -60,11 +63,16 @@ class HybridRetriever:
     """Computes dense (E5) and sparse (BM25S) retrieval paths with Weighted Score Fusion."""
 
     def __init__(
-        self, top_k: int = 50, candidate_pool_size: int = 200, alpha: float = 0.55
+        self,
+        top_k: int = 50,
+        candidate_pool_size: int = 200,
+        alpha: float = 0.55,
+        vote_weight: float = 0.15,
     ) -> None:
         self.top_k = top_k
         self.candidate_pool_size = candidate_pool_size
         self.alpha = alpha
+        self.vote_weight = vote_weight
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
         if not settings.vectors_file.exists():
@@ -87,11 +95,12 @@ class HybridRetriever:
         )
         self.doc_tensors = F.normalize(self.doc_tensors, p=2, dim=1)
 
-        self.stemmer = None
+        self.stemmer: Any = None
         try:
             import Stemmer
 
             self.stemmer = Stemmer.Stemmer("russian")
+            logger.debug("PyStemmer successfully loaded.")
         except ImportError:
             logger.warning("PyStemmer not installed. Stemming disabled.")
 
@@ -112,7 +121,7 @@ class HybridRetriever:
             scores = torch.matmul(query_embeddings, self.doc_tensors.T)
             top_scores, top_indices = torch.topk(scores, k=k, dim=1)
         except torch.cuda.OutOfMemoryError:
-            logger.warning("CUDA OOM. Switching to CPU.")
+            logger.warning("CUDA OOM detected. Falling back to CPU.")
             torch.cuda.empty_cache()
             scores = torch.matmul(query_embeddings.cpu(), self.doc_tensors.cpu().T)
             top_scores, top_indices = torch.topk(scores, k=k, dim=1)
@@ -145,12 +154,15 @@ class HybridRetriever:
             query_tokens, corpus=self.doc_ids, k=k, return_as="tuple"
         )
 
+        # Unpack tuple to avoid "Cannot access attribute" type checking errors
+        retrieved_docs, retrieved_scores = results
+
         query_scores: list[dict[str, float]] = []
         for i in range(len(raw_queries)):
             query_scores.append(
                 {
                     doc_id: float(score)
-                    for doc_id, score in zip(results.documents[i], results.scores[i])
+                    for doc_id, score in zip(retrieved_docs[i], retrieved_scores[i])
                 }
             )
         return query_scores
@@ -184,7 +196,7 @@ class HybridRetriever:
 
             # Static quality helpfulness boost factor
             vote_prior = self.doc_vote_scores.get(doc_id, 0.0)
-            fused_scores[doc_id] = base_score * (1.0 + 0.15 * vote_prior)
+            fused_scores[doc_id] = base_score * (1.0 + self.vote_weight * vote_prior)
 
         sorted_docs = sorted(fused_scores.items(), key=lambda x: x[1], reverse=True)[
             : self.top_k
@@ -236,7 +248,137 @@ class PipelineEvaluator:
     """Implements pipeline tasks: closed-loop testing, standard evaluation, pruning, and interactive annotation."""
 
     @staticmethod
-    def run_closed_loop() -> None:
+    def _calculate_ndcg3(ratings: list[int]) -> float:
+        """Calculates normalized Discounted Cumulative Gain at rank 3 using exponential gain formula."""
+        # Standard formulation: (2^rel - 1) / log2(i + 1)
+        dcg = (
+            (2.0 ** ratings[0] - 1.0)
+            + (2.0 ** ratings[1] - 1.0) / math.log2(3)
+            + (2.0 ** ratings[2] - 1.0) / math.log2(4)
+        )
+        ideal_ratings = sorted(ratings, reverse=True)
+        idcg = (
+            (2.0 ** ideal_ratings[0] - 1.0)
+            + (2.0 ** ideal_ratings[1] - 1.0) / math.log2(3)
+            + (2.0 ** ideal_ratings[2] - 1.0) / math.log2(4)
+        )
+        if idcg < 1e-9:
+            return 0.0
+        return dcg / idcg
+
+    @staticmethod
+    def _calculate_mrr3(ratings: list[int]) -> float:
+        """Calculates Mean Reciprocal Rank at rank 3 considering grades >= 2 as relevant."""
+        for i, r in enumerate(ratings):
+            if r >= 2:  # Relevant threshold (2 or 3)
+                return 1.0 / (i + 1)
+        return 0.0
+
+    @classmethod
+    def run_tune(cls) -> None:
+        """Executes a Grid Search on the closed-loop dataset to find optimal hyperparameters."""
+        logger.info("Initializing Auto-Tuner on closed dataset...")
+        val_data = read_json(settings.validation_set_file)
+        val_doc_ids = {str(item["relevant_doc_id"]) for item in val_data}
+
+        payload = read_json(settings.payload_file)
+        filtered_docs = [item for item in payload if str(item["id"]) in val_doc_ids]
+        doc_ids = [str(item["id"]) for item in filtered_docs]
+        corpus = [item["text"] for item in filtered_docs]
+        priors = {
+            str(item["id"]): float(item.get("score", 0.0)) for item in filtered_docs
+        }
+
+        if bm25s is None:
+            logger.error("No bm25s module present")
+            return
+
+        # Sparse
+        retriever = bm25s.BM25()
+        retriever.index(bm25s.tokenize(corpus, stopwords="ru"))
+        raw_queries = [item["query"] for item in val_data]
+        sparse_res = retriever.retrieve(
+            bm25s.tokenize(raw_queries),
+            corpus=doc_ids,
+            k=len(doc_ids),
+            return_as="tuple",
+        )
+
+        # Unpack tuple to avoid "Cannot access attribute" type checking errors
+        sparse_docs, sparse_scores = sparse_res
+
+        # Dense
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = SentenceTransformer(settings.model_name, device=device)
+        prefix = "query: " if "e5" in settings.model_name.lower() else ""
+        q_embs = model.encode(
+            [f"{prefix}{q}" for q in raw_queries],
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+        )
+        d_embs = model.encode(
+            [f"passage: {t}" for t in corpus],
+            convert_to_tensor=True,
+            normalize_embeddings=True,
+        )
+        dense_matrix = torch.matmul(q_embs, d_embs.T).cpu().numpy()
+
+        qrels = {
+            str(item["query_id"]): {str(item["relevant_doc_id"]): 1}
+            for item in val_data
+        }
+
+        normalized_queries = []
+        for i, item in enumerate(val_data):
+            d_map = {doc_ids[j]: float(s) for j, s in enumerate(dense_matrix[i])}
+            s_map = {d: float(s) for d, s in zip(sparse_docs[i], sparse_scores[i])}
+
+            d_min, d_max = min(d_map.values()), max(d_map.values())
+            s_min, s_max = min(s_map.values()), max(s_map.values())
+
+            norm_d = {
+                d: (d_map[d] - d_min) / (d_max - d_min) if d_max > d_min else 1.0
+                for d in doc_ids
+            }
+            norm_s = {
+                d: (s_map.get(d, 0.0) - s_min) / (s_max - s_min)
+                if s_max > s_min
+                else 1.0
+                for d in doc_ids
+            }
+
+            normalized_queries.append((str(item["query_id"]), norm_d, norm_s))
+
+        best_ndcg, best_params = 0.0, (0.0, 0.0)
+        logger.info("Grid scanning Alpha (0.0 - 1.0) and Vote Weight (0.0 - 0.3)...")
+
+        for alpha in np.linspace(0.0, 1.0, 11):
+            for vw in np.linspace(0.0, 0.3, 4):
+                run = {}
+                for q_id, norm_d, norm_s in normalized_queries:
+                    fused = {
+                        d: (alpha * norm_d[d] + (1.0 - alpha) * norm_s[d])
+                        * (1.0 + vw * priors.get(d, 0.0))
+                        for d in doc_ids
+                    }
+                    run[q_id] = dict(
+                        sorted(fused.items(), key=lambda x: x[1], reverse=True)[:10]
+                    )
+
+                ndcg_score = ir_measures.calc_aggregate([nDCG @ 10], qrels, run)[
+                    nDCG @ 10
+                ]
+                if ndcg_score > best_ndcg:
+                    best_ndcg = ndcg_score
+                    best_params = (alpha, vw)
+
+        logger.success(
+            f"Tuning Complete! Optimal Params -> Alpha: {best_params[0]:.2f}, "
+            f"Vote Weight: {best_params[1]:.2f} (Closed nDCG@10: {best_ndcg:.4f})"
+        )
+
+    @classmethod
+    def run_closed_loop(cls) -> None:
         """Evaluates metrics on the noiseless (closed base) subset of documents."""
         if not settings.validation_set_file.exists():
             logger.error("Validation set file missing.")
@@ -299,8 +441,8 @@ class PipelineEvaluator:
         for m in metrics:
             logger.info(f"{str(m):<10}: {results[m]:.4f}")
 
-    @staticmethod
-    def run_evaluate_run() -> None:
+    @classmethod
+    def run_evaluate_run(cls) -> None:
         """Evaluates metrics of the generated hybrid run against both synthetic and manual sets."""
         safe_model_name = settings.model_name.replace("/", "_")
         run_file_path = (
@@ -344,6 +486,10 @@ class PipelineEvaluator:
                 total_ann_docs = 0
                 total_ann_rel_docs = 0
                 total_ann_p1_rel = 0
+                total_ndcg3 = 0.0
+                total_mrr3 = 0.0
+                hard_queries = []
+                q_map = {item["query_id"]: item["query"] for item in val_data}
 
                 for q_id, doc_ratings in annotations.items():
                     if q_id not in run:
@@ -354,13 +500,26 @@ class PipelineEvaluator:
 
                     if all(doc_id in doc_ratings for doc_id, _ in top_3):
                         total_ann_queries += 1
+                        q_ratings = []
                         for rank, (doc_id, _) in enumerate(top_3, start=1):
-                            is_rel = doc_ratings[doc_id]
+                            rating = doc_ratings[doc_id]
+                            q_ratings.append(rating)
                             total_ann_docs += 1
-                            if is_rel:
+
+                            # Graded threshold >= 2 is considered relevant
+                            if rating >= 2:
                                 total_ann_rel_docs += 1
                                 if rank == 1:
                                     total_ann_p1_rel += 1
+
+                        total_ndcg3 += cls._calculate_ndcg3(q_ratings)
+                        total_mrr3 += cls._calculate_mrr3(q_ratings)
+
+                        # Save absolute failures (all candidates rated 0 or 1)
+                        if sum(1 for r in q_ratings if r >= 2) == 0:
+                            hard_queries.append(
+                                {"query_id": q_id, "query": q_map.get(q_id, "")}
+                            )
 
                 if total_ann_queries > 0:
                     true_p3 = (
@@ -369,12 +528,27 @@ class PipelineEvaluator:
                         else 0.0
                     )
                     true_p1 = total_ann_p1_rel / total_ann_queries
+                    true_ndcg3 = total_ndcg3 / total_ann_queries
+                    true_mrr3 = total_mrr3 / total_ann_queries
+
                     logger.success(
                         "--- TRUE METRICS (HUMAN-IN-THE-LOOP ANNOTATIONS) ---"
                     )
                     logger.info(f"Evaluated queries  : {total_ann_queries}")
-                    logger.info(f"True Precision@1   : {true_p1:.4%}")
-                    logger.info(f"True Precision@3   : {true_p3:.4%}")
+                    logger.info(f"True Precision@1   : {true_p1:.2%}")
+                    logger.info(f"True Precision@3   : {true_p3:.2%}")
+                    logger.info(f"True nDCG@3        : {true_ndcg3:.2%}")
+                    logger.info(f"True MRR@3         : {true_mrr3:.2%}")
+
+                    if hard_queries:
+                        hq_path = (
+                            settings.validation_set_file.parent
+                            / "hard_queries_report.json"
+                        )
+                        write_json(hq_path, hard_queries)
+                        logger.warning(
+                            f"Found {len(hard_queries)} failed queries. Exported to {hq_path.name} for analysis."
+                        )
                 else:
                     logger.warning(
                         "No fully annotated queries found in manual_annotations.json yet."
@@ -382,8 +556,8 @@ class PipelineEvaluator:
             except Exception as e:
                 logger.warning(f"Failed to calculate manual metrics: {e}")
 
-    @staticmethod
-    def run_pruning(threshold: float = 0.78) -> None:
+    @classmethod
+    def run_pruning(cls, threshold: float = 0.78) -> None:
         """Filters validation dataset by removing low-quality generated queries."""
         if not settings.validation_set_file.exists():
             logger.error("Validation set file missing.")
@@ -429,9 +603,123 @@ class PipelineEvaluator:
             f"Pruning finished. Kept: {len(pruned_data)}. Dropped: {dropped_count}."
         )
 
-    @staticmethod
-    def run_interactive_assessment(num_samples: int = 15) -> None:
+    @classmethod
+    def run_interactive_assessment(cls, num_samples: int = 15) -> None:
         """Runs interactive CLI tool to calculate real-world precision with state saving."""
+        from rich.live import Live
+
+        console = Console()
+        (
+            doc_id_to_text,
+            query_map,
+            run_data,
+            annotations,
+            annotations_file,
+        ) = cls._load_assessment_data()
+
+        unannotated_q_ids = cls._get_unannotated_queries(
+            query_map, run_data, annotations
+        )
+        if not unannotated_q_ids:
+            logger.success("All available queries have already been fully annotated!")
+            unannotated_q_ids = [q for q in query_map if q in run_data]
+
+        sampled_q_ids = random.sample(
+            unannotated_q_ids, min(num_samples, len(unannotated_q_ids))
+        )
+
+        curr_idx = 0
+        try:
+            # Live с screen=True создает "оконное" приложение прямо в консоли, не засоряя историю
+            with Live(console=console, screen=True, auto_refresh=False) as live:
+                while curr_idx < len(sampled_q_ids):
+                    q_id = sampled_q_ids[curr_idx]
+                    query = query_map[q_id]
+                    top_3 = sorted(
+                        run_data[q_id].items(), key=lambda x: x[1], reverse=True
+                    )[:3]
+
+                    if q_id not in annotations:
+                        annotations[q_id] = {}
+
+                    # Ищем первого неоцененного кандидата
+                    unrated_idx = next(
+                        (
+                            i
+                            for i, (d_id, _) in enumerate(top_3)
+                            if d_id not in annotations[q_id]
+                        ),
+                        -1,
+                    )
+
+                    if unrated_idx == -1:
+                        curr_idx += 1
+                        continue
+
+                    doc_id = top_3[unrated_idx][0]
+                    raw_text = doc_id_to_text.get(doc_id, "Текст отсутствует").replace(
+                        "\n", " "
+                    )
+
+                    # 1. Отрисовка UI
+                    layout = cls._build_assessment_card(
+                        query=query,
+                        doc_id=doc_id,
+                        raw_text=raw_text,
+                        curr_idx=curr_idx,
+                        total_queries=len(sampled_q_ids),
+                        rank=unrated_idx + 1,
+                    )
+                    live.update(layout, refresh=True)
+
+                    # 2. Ожидание экшена
+                    action = None
+                    while True:
+                        user_input = get_single_char()
+                        if user_input in ("0", "1", "2", "3"):
+                            annotations[q_id][doc_id] = int(user_input)
+                            write_json(annotations_file, annotations)  # type: ignore
+                            action = "next"
+                            break
+                        elif user_input == "b":
+                            action = "back"
+                            break
+                        elif user_input == "s":
+                            action = "skip"
+                            break
+                        elif user_input in ("q", "\x03"):
+                            raise KeyboardInterrupt
+
+                    # 3. Обработка навигации
+                    if action == "back":
+                        curr_idx = cls._handle_back_action(
+                            curr_idx,
+                            unrated_idx,
+                            q_id,
+                            sampled_q_ids,
+                            run_data,
+                            annotations,
+                        )
+                    elif action == "skip":
+                        if q_id in annotations:
+                            del annotations[q_id]
+                        curr_idx += 1
+
+        except KeyboardInterrupt:
+            console.print(
+                "[bold yellow]Сессия приостановлена. Прогресс сохранен.[/bold yellow]"
+            )
+
+        cls._calculate_and_show_metrics(annotations, run_data, console)
+
+    # =========================================================================
+    # Вспомогательные методы (Helpers) для обеспечения чистоты архитектуры
+    # =========================================================================
+
+    @classmethod
+    def _load_assessment_data(cls) -> tuple:
+        import sys
+
         safe_model_name = settings.model_name.replace("/", "_")
         run_file = settings.vectors_file.parent / f"run_hybrid_{safe_model_name}.json"
 
@@ -453,105 +741,132 @@ class PipelineEvaluator:
         if annotations_file.exists():
             try:
                 annotations = read_json(annotations_file)  # type: ignore
-                logger.info(f"Loaded {len(annotations)} previously annotated queries.")
-            except Exception as e:
-                logger.warning(
-                    f"Failed to load existing progress: {e}. Starting fresh."
-                )
+            except Exception:
+                pass
 
+        return doc_id_to_text, query_map, run_data, annotations, annotations_file
+
+    @classmethod
+    def _get_unannotated_queries(
+        cls, query_map: dict, run_data: dict, annotations: dict
+    ) -> list:
         available_q_ids = [q_id for q_id in query_map if q_id in run_data]
-        if not available_q_ids:
-            logger.error("No valid queries found.")
-            return
-
-        unannotated_q_ids = []
-        for q_id in available_q_ids:
-            top_3 = sorted(run_data[q_id].items(), key=lambda x: x[1], reverse=True)[:3]
-            already_annotated = all(
-                doc_id in annotations.get(q_id, {}) for doc_id, _ in top_3
-            )
-            if not already_annotated:
-                unannotated_q_ids.append(q_id)
-
-        if not unannotated_q_ids:
-            logger.success("All available queries have already been fully annotated!")
-            unannotated_q_ids = available_q_ids
-
-        sampled_q_ids = random.sample(
-            unannotated_q_ids, min(num_samples, len(unannotated_q_ids))
-        )
-
-        print("\n" + "=" * 100)
-        print("ИНТЕРАКТИВНЫЙ АССЕССОРСКИЙ ТЕСТ (Сохраняемый прогресс)")
-        print(f"Оцените Top-3 кандидатов для {len(sampled_q_ids)} запросов.")
-        print(
-            "Нажмите: '1' — если релевантен, '0' — если нет, 'q' — сохранить и выйти."
-        )
-        print("=" * 100)
-
-        queries_completed = 0
-        total_evaluated_docs = 0
-        relevant_docs_count = 0
-        total_p1_relevant = 0
-
-        try:
-            for q_idx, q_id in enumerate(sampled_q_ids, start=1):
-                query = query_map[q_id]
-                top_3 = sorted(
-                    run_data[q_id].items(), key=lambda x: x[1], reverse=True
+        return [
+            q
+            for q in available_q_ids
+            if not all(
+                d in annotations.get(q, {})
+                for d, _ in sorted(
+                    run_data[q].items(), key=lambda x: x[1], reverse=True
                 )[:3]
+            )
+        ]
 
-                print(f"\n[{q_idx}/{len(sampled_q_ids)}] ЗАПРОС: '{query}'")
-                print("-" * 100)
+    @staticmethod
+    def _highlight_text(text: str, query: str):
+        import re
+        from rich.text import Text
 
-                if q_id not in annotations:
-                    annotations[q_id] = {}
+        terms = [re.escape(w) for w in query.split() if len(w) > 2]
+        rich_text = Text(text[:800] + ("..." if len(text) > 800 else ""))
+        if terms:
+            pattern = re.compile(f"({'|'.join(terms)})", re.IGNORECASE)
+            for match in pattern.finditer(rich_text.plain):
+                rich_text.stylize("bold black on yellow", match.start(), match.end())
+        return rich_text
 
-                for rank, (doc_id, _) in enumerate(top_3, start=1):
-                    text = doc_id_to_text.get(doc_id, "Текст отсутствует")
+    @classmethod
+    def _build_assessment_card(
+        cls,
+        query: str,
+        doc_id: str,
+        raw_text: str,
+        curr_idx: int,
+        total_queries: int,
+        rank: int,
+    ):
+        from rich.layout import Layout
+        from rich.align import Align
 
-                    if doc_id in annotations[q_id]:
-                        is_relevant = annotations[q_id][doc_id]
-                        print(
-                            f"  Кандидат #{rank} (ID: {doc_id}) -> Авто-загружено: {is_relevant}"
-                        )
-                    else:
-                        print(f"  Кандидат #{rank} (ID: {doc_id})")
-                        print(f"  Текст: {text[:280]}...\n")
-                        print(
-                            "  Релевантен? (1 = Да, 0 = Нет, q = Выйти): ",
-                            end="",
-                            flush=True,
-                        )
+        layout = Layout()
+        layout.split_column(
+            Layout(name="header", size=5),
+            Layout(name="body"),
+            Layout(name="footer", size=5),
+        )
 
-                        while True:
-                            user_input = get_single_char()
-                            if user_input in ("1", "0"):
-                                is_relevant = int(user_input)
-                                print(is_relevant)
-                                annotations[q_id][doc_id] = is_relevant
-                                write_json(annotations_file, annotations)  # type: ignore
-                                break
-                            elif user_input in ("q", "\x03"):
-                                print("q\n")
-                                raise KeyboardInterrupt
+        layout["header"].update(
+            Panel(
+                f"[bold white]{query}[/bold white]",
+                title=f"[bold cyan]ЗАПРОС {curr_idx + 1}/{total_queries}[/bold cyan] • [dim]Кандидат {rank}/3[/dim]",
+                border_style="cyan",
+                padding=(1, 2),
+            )
+        )
 
-                    total_evaluated_docs += 1
-                    if is_relevant:
-                        relevant_docs_count += 1
-                        if rank == 1:
-                            total_p1_relevant += 1
+        layout["body"].update(
+            Panel(
+                cls._highlight_text(raw_text, query),
+                title=f"[bold blue]Текст отзыва (ID: {doc_id})[/bold blue]",
+                border_style="blue",
+                padding=(1, 2),
+            )
+        )
 
-                queries_completed += 1
-                print("-" * 100)
+        footer_text = (
+            "[bold]Оценка:[/bold] [[green]3[/green]=Топ | [yellow]2[/yellow]=Рел | [magenta]1[/magenta]=Около | [red]0[/red]=Мусор]\n"
+            "[dim]────────────────────────────────────────────────────────────────────────[/dim]\n"
+            "[bold]Экшен:[/bold] [[blue]b[/blue]=Назад | [yellow]s[/yellow]=Скип | [dim]q[/dim]=Выход]      👉 Ваш выбор: _"
+        )
 
-        except KeyboardInterrupt:
-            print("\nСессия приостановлена. Прогресс успешно сохранен.")
+        layout["footer"].update(
+            Panel(
+                Align.center(footer_text),
+                border_style="white",
+            )
+        )
+        return layout
 
+    @classmethod
+    def _handle_back_action(
+        cls,
+        curr_idx: int,
+        unrated_idx: int,
+        q_id: str,
+        sampled_q_ids: list,
+        run_data: dict,
+        annotations: dict,
+    ) -> int:
+        """Откатывает оценку на один шаг назад, возвращая обновленный индекс."""
+        if unrated_idx > 0:
+            top_3 = sorted(run_data[q_id].items(), key=lambda x: x[1], reverse=True)[:3]
+            prev_doc = top_3[unrated_idx - 1][0]
+            del annotations[q_id][prev_doc]
+            return curr_idx
+
+        if curr_idx > 0:
+            new_idx = curr_idx - 1
+            prev_q_id = sampled_q_ids[new_idx]
+            prev_top_3 = sorted(
+                run_data[prev_q_id].items(), key=lambda x: x[1], reverse=True
+            )[:3]
+            for r in reversed(range(3)):
+                p_doc = prev_top_3[r][0]
+                if p_doc in annotations.get(prev_q_id, {}):
+                    del annotations[prev_q_id][p_doc]
+                    break
+            return new_idx
+
+        return curr_idx
+
+    @classmethod
+    def _calculate_and_show_metrics(cls, annotations: dict, run_data: dict, console):
         total_ann_queries = 0
         total_ann_docs = 0
         total_ann_rel_docs = 0
         total_ann_p1_rel = 0
+        total_ndcg3 = 0.0
+        total_mrr3 = 0.0
 
         for q_id, doc_ratings in annotations.items():
             if q_id not in run_data:
@@ -559,27 +874,46 @@ class PipelineEvaluator:
             top_3 = sorted(run_data[q_id].items(), key=lambda x: x[1], reverse=True)[:3]
             if all(doc_id in doc_ratings for doc_id, _ in top_3):
                 total_ann_queries += 1
+                q_ratings = []
                 for rank, (doc_id, _) in enumerate(top_3, start=1):
                     is_rel = doc_ratings[doc_id]
+                    q_ratings.append(is_rel)
                     total_ann_docs += 1
-                    if is_rel:
+                    if is_rel >= 2:
                         total_ann_rel_docs += 1
                         if rank == 1:
                             total_ann_p1_rel += 1
 
+                total_ndcg3 += cls._calculate_ndcg3(q_ratings)
+                total_mrr3 += cls._calculate_mrr3(q_ratings)
+
         if total_ann_queries > 0:
-            true_p3 = (
-                (total_ann_rel_docs / total_ann_docs) if total_ann_docs > 0 else 0.0
+            table = Table(
+                title="ОБЩИЕ НАКОПЛЕННЫЕ ИСТИННЫЕ МЕТРИКИ (HUMAN-IN-THE-LOOP)",
+                show_header=True,
+                header_style="bold magenta",
+                title_style="bold blue",
+                expand=True,
             )
-            true_p1 = total_ann_p1_rel / total_ann_queries
-            print("\n" + "=" * 100)
-            print("ОБЩИЕ НАКОПЛЕННЫЕ ИСТИННЫЕ МЕТРИКИ (HUMAN-IN-THE-LOOP):")
-            print(f"  Всего размечено запросов : {total_ann_queries}")
-            print(f"  Истинный Precision@1     : {true_p1:.2%}")
-            print(f"  Истинный Precision@3     : {true_p3:.2%}")
-            print("=" * 100)
+            table.add_column("Метрика", justify="left", style="white")
+            table.add_column("Значение", justify="right", style="bold yellow")
+
+            table.add_row("Всего размечено запросов", str(total_ann_queries))
+            table.add_row(
+                "Истинный Precision@1", f"{total_ann_p1_rel / total_ann_queries:.2%}"
+            )
+            table.add_row(
+                "Истинный Precision@3",
+                f"{(total_ann_rel_docs / total_ann_docs) if total_ann_docs > 0 else 0.0:.2%}",
+            )
+            table.add_row("Истинный nDCG@3", f"{total_ndcg3 / total_ann_queries:.2%}")
+            table.add_row("Истинный MRR@3", f"{total_mrr3 / total_ann_queries:.2%}")
+
+            console.print(table)
         else:
-            print("\nНедостаточно данных для расчета накопленных метрик.")
+            console.print(
+                "\n[bold red]Недостаточно данных для расчета метрик.[/bold red]"
+            )
 
 
 def main() -> None:
@@ -590,9 +924,21 @@ def main() -> None:
         "--mode",
         type=str,
         required=True,
-        choices=["closed", "generate", "evaluate", "prune", "annotate"],
-        help="Command mode: 'closed' (noiseless test), 'generate' (hybrid run), "
+        choices=["tune", "generate", "evaluate", "prune", "annotate"],
+        help="Command mode: 'tune' (hyperparameter tuner), 'generate' (hybrid run), "
         "'evaluate' (standard test), 'prune' (cleanup dataset), 'annotate' (TUI).",
+    )
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        default=0.55,
+        help="Weight for dense retrieval (default: 0.55).",
+    )
+    parser.add_argument(
+        "--vote-weight",
+        type=float,
+        default=0.15,
+        help="Boost factor for highly helpful reviews (default: 0.15).",
     )
     parser.add_argument(
         "--threshold",
@@ -608,15 +954,15 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    if args.mode == "closed":
-        PipelineEvaluator.run_closed_loop()
+    if args.mode == "tune":
+        PipelineEvaluator.run_tune()
     elif args.mode == "generate":
         safe_model_name = settings.model_name.replace("/", "_")
         output_path = (
             settings.vectors_file.parent / f"run_hybrid_{safe_model_name}.json"
         )
         with HybridRetriever(
-            top_k=50, candidate_pool_size=200, alpha=0.55
+            alpha=args.alpha, vote_weight=args.vote_weight
         ) as retriever:
             retriever.generate(output_path)
     elif args.mode == "evaluate":
