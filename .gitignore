@@ -3,7 +3,7 @@ data
 .env
 .vscode
 *.pyc
-__pycache__/
+**/__pycache__/
 *.py[cod]
 
 project_dump.txt
