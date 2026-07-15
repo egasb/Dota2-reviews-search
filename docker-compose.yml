@@ -1,6 +1,6 @@
 services:
   qdrant:
-    image: qdrant/qdrant:v1.11.0
+    image: qdrant/qdrant:latest
     container_name: dota2_qdrant
     restart: unless-stopped
     ports:
@@ -11,11 +11,10 @@ services:
     environment:
       QDRANT__SERVICE__GRPC_PORT: "6334"
       QDRANT__LOG_LEVEL: "INFO"
-    healthcheck:
-      test: ["CMD-SHELL", "bash -c ':> /dev/tcp/127.0.0.1/6333' || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # Штатного надёжного healthcheck-инструмента в образе qdrant/qdrant нет
+    # (curl/wget сознательно убраны, см. github.com/qdrant/qdrant/issues/4250
+    # и /issues/3491 — открытые issue без официального решения). Проверка
+    # готовности перенесена в src/api/main.py (retry на старте FastAPI).
 
   api:
     build: .
@@ -26,15 +25,12 @@ services:
     environment:
       - QDRANT_HOST=qdrant
       - USE_MOCK_EMBEDDER=true
-      # --- ДОБАВЛЕННЫЕ СТРОКИ НИЖЕ ---
-      - QDRANT_PREFER_GRPC=true   # Включаем быстрый бинарный протокол
-      - BATCH_SIZE=1000           # Уменьшаем размер пачки с 5000 до 1000
-      - QDRANT_TIMEOUT=120.0      # Даем базе 2 минуты на ответ вместо 30 секунд
-    volumes:
-      - .:/app
+      - QDRANT_PREFER_GRPC=true
+      - BATCH_SIZE=1000
+      - QDRANT_TIMEOUT=120.0
     depends_on:
       qdrant:
-        condition: service_healthy
+        condition: service_started   # было: service_healthy
 
 volumes:
   qdrant_storage:

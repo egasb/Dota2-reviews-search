@@ -20,11 +20,11 @@ class QdrantClientSingleton:
     def get_client(cls) -> QdrantClient:
         if cls._instance is None:
             cls._instance = QdrantClient(
-                host=settings.QDRANT_HOST,
-                port=settings.QDRANT_PORT,
-                grpc_port=settings.QDRANT_GRPC_PORT,
-                prefer_grpc=settings.PREFER_GRPC,
-                timeout=settings.QDRANT_TIMEOUT,
+                host=settings.qdrant_host,
+                port=settings.qdrant_port,
+                grpc_port=settings.qdrant_grpc_port,
+                prefer_grpc=settings.qdrant_prefer_grpc,
+                timeout=settings.qdrant_timeout,
             )
         return cls._instance
 
@@ -34,3 +34,4 @@ class QdrantClientSingleton:
         if cls._instance is not None:
             cls._instance.close()
         cls._instance = None
+

@@ -17,6 +17,8 @@
 косинусного расстояния, чтобы сравнение было корректным.
 """
 
+import time
+
 from qdrant_client.models import (
     Distance,
     ScalarQuantization,
@@ -35,19 +37,19 @@ def _distance_from_config() -> Distance:
         "Euclid": Distance.EUCLID,
         "Dot": Distance.DOT,
     }
-    return mapping.get(settings.DISTANCE_METRIC, Distance.COSINE)
+    return mapping.get(settings.distance_metric, Distance.COSINE)
 
 
 def create_flat_collection() -> None:
     """Итерация 1 (Baseline): коллекция для точного поиска."""
     client = QdrantClientSingleton.get_client()
-    if client.collection_exists(settings.COLLECTION_FLAT):
+    if client.collection_exists(settings.collection_flat):
         return
 
     client.create_collection(
-        collection_name=settings.COLLECTION_FLAT,
+        collection_name=settings.collection_flat,
         vectors_config=VectorParams(
-            size=settings.VECTOR_SIZE,
+            size=settings.vector_size,
             distance=_distance_from_config(),
         ),
     )
@@ -56,13 +58,13 @@ def create_flat_collection() -> None:
 def create_quantized_collection() -> None:
     """Итерация 2 (Optimized): коллекция со Scalar Quantization INT8."""
     client = QdrantClientSingleton.get_client()
-    if client.collection_exists(settings.COLLECTION_QUANTIZED):
+    if client.collection_exists(settings.collection_quantized):
         return
 
     client.create_collection(
-        collection_name=settings.COLLECTION_QUANTIZED,
+        collection_name=settings.collection_quantized,
         vectors_config=VectorParams(
-            size=settings.VECTOR_SIZE,
+            size=settings.vector_size,
             distance=_distance_from_config(),
         ),
         quantization_config=ScalarQuantization(
@@ -84,8 +86,10 @@ def ensure_collections() -> None:
 def recreate_collections() -> None:
     """Полностью пересоздать обе коллекции (удаляет все данные!)."""
     client = QdrantClientSingleton.get_client()
-    for name in (settings.COLLECTION_FLAT, settings.COLLECTION_QUANTIZED):
+    for name in (settings.collection_flat, settings.collection_quantized):
         if client.collection_exists(name):
             client.delete_collection(name)
+    time.sleep(1.0)
     create_flat_collection()
     create_quantized_collection()
+

@@ -23,7 +23,7 @@ def batch_upsert(
     ids: Sequence[int],
     vectors: np.ndarray,
     payloads: Sequence[dict],
-    batch_size: int = settings.BATCH_SIZE,
+    batch_size: int = settings.batch_size,
 ) -> int:
     """
     Пакетная вставка точек в коллекцию батчами по batch_size (по умолчанию
@@ -99,3 +99,4 @@ def search(
         with_payload=True,
     )
     return result.points
+

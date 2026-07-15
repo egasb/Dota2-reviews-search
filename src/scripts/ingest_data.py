@@ -6,7 +6,7 @@
      и не передан флаг --no-precomputed — читаем предрассчитанные векторы
      через FileAdapter батчами, синхронно с батчами JSONL.
   2. Иначе — считаем векторы на лету через ModelAdapter (mock или реальная
-     модель, в зависимости от settings.USE_MOCK_EMBEDDER).
+     модель, в зависимости от settings.use_mock_embedder).
 
 Запуск:
     python scripts/ingest_data.py --recreate
@@ -20,7 +20,7 @@ from typing import Iterator, List
 
 import numpy as np
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
 from src.adapters.file_adapter import FileAdapter  # noqa: E402
 from src.adapters.model_adapter import ModelAdapter  # noqa: E402
@@ -88,25 +88,25 @@ def run(recreate: bool, use_precomputed_vectors: bool) -> None:
         ensure_collections()
 
     embedder = ModelAdapter(
-        vector_size=settings.VECTOR_SIZE,
-        use_mock=settings.USE_MOCK_EMBEDDER,
-        model_name=settings.EMBEDDER_MODEL_NAME,
+        vector_size=settings.vector_size,
+        use_mock=settings.use_mock_embedder,
+        model_name=settings.model_name,
     )
-    file_adapter = FileAdapter(vector_size=settings.VECTOR_SIZE)
+    file_adapter = FileAdapter(vector_size=settings.vector_size)
 
-    vectors_path = Path(settings.VECTORS_PATH)
+    vectors_path = settings.vectors_file
     use_file_vectors = use_precomputed_vectors and vectors_path.exists()
 
     vector_batch_iter = None
     if use_file_vectors:
         print(f"[ingest] Используем предрассчитанные векторы из {vectors_path}")
-        vector_batch_iter = file_adapter.load_batches(str(vectors_path), settings.BATCH_SIZE)
+        vector_batch_iter = file_adapter.load_batches(str(vectors_path), settings.batch_size)
     else:
-        source = "mock" if settings.USE_MOCK_EMBEDDER else "live-модель"
+        source = "mock" if settings.use_mock_embedder else "live-модель"
         print(f"[ingest] Предрассчитанные векторы не найдены — считаем на лету ({source})")
 
     total_inserted = 0
-    for batch in read_batches(settings.DATA_PATH, settings.BATCH_SIZE):
+    for batch in read_batches(str(settings.interim_file), settings.batch_size):
         ids = [build_point_id(record["id"]) for record in batch]
         payloads = [build_payload(record) for record in batch]
 
@@ -127,8 +127,8 @@ def run(recreate: bool, use_precomputed_vectors: bool) -> None:
             texts = [record["text"] for record in batch]
             vectors = np.array(embedder.encode_batch(texts), dtype=np.float32)
 
-        batch_upsert(settings.COLLECTION_FLAT, ids, vectors, payloads, settings.BATCH_SIZE)
-        batch_upsert(settings.COLLECTION_QUANTIZED, ids, vectors, payloads, settings.BATCH_SIZE)
+        batch_upsert(settings.collection_flat, ids, vectors, payloads, settings.batch_size)
+        batch_upsert(settings.collection_quantized, ids, vectors, payloads, settings.batch_size)
 
         total_inserted += len(batch)
         print(f"[ingest] Загружено {total_inserted} отзывов...")
@@ -149,3 +149,4 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     run(recreate=args.recreate, use_precomputed_vectors=not args.no_precomputed)
+

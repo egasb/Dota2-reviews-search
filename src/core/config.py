@@ -30,7 +30,7 @@ class Settings(BaseSettings):
     collection_quantized: str = "dota2_quantized"
     
     # --- Параметры векторов ---
-    vector_size: int = 384
+    vector_size: int = 312
     distance_metric: str = "Cosine"
 
     # --- API ---

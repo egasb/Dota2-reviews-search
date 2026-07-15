@@ -56,14 +56,20 @@ class ModelAdapter(BaseEmbedderAdapter):
     def encode(self, text: str) -> List[float]:
         if self.use_mock:
             return self._mock_encode(text)
-        vector = self._model.encode(text, normalize_embeddings=True)
+        # ВАЖНО: src/pipeline/embed.py кодирует отзывы (документы) с префиксом
+        # "passage: " — того требует e5-семейство моделей (settings.model_name =
+        # intfloat/multilingual-e5-small). Поисковый запрос должен кодироваться
+        # с симметричным префиксом "query: ", иначе запрос и документы окажутся
+        # в разных семантических подпространствах и релевантность резко упадёт.
+        vector = self._model.encode(f"query: {text}", normalize_embeddings=True)
         return vector.tolist()
 
     def encode_batch(self, texts: List[str]) -> List[List[float]]:
         if self.use_mock:
             return [self._mock_encode(text) for text in texts]
+        prefixed = [f"query: {text}" for text in texts]
         vectors = self._model.encode(
-            texts, normalize_embeddings=True, batch_size=64, show_progress_bar=False
+            prefixed, normalize_embeddings=True, batch_size=64, show_progress_bar=False
         )
         return vectors.tolist()
 
@@ -84,3 +90,4 @@ class ModelAdapter(BaseEmbedderAdapter):
             vector = vector / norm
 
         return vector.astype(np.float32).tolist()
+

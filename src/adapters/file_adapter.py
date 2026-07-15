@@ -19,7 +19,7 @@ from .base import BaseVectorLoaderAdapter
 
 
 class FileAdapter(BaseVectorLoaderAdapter):
-    def __init__(self, vector_size: int = 384) -> None:
+    def __init__(self, vector_size: int = 312) -> None:
         self.vector_size = vector_size
 
     def load(self, path: str) -> np.ndarray:

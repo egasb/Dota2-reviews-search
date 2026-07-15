@@ -16,7 +16,7 @@ from typing import Dict, List, Optional
 
 import psutil
 
-sys.path.append(str(Path(__file__).resolve().parent.parent))
+sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
 
 from src.adapters.model_adapter import ModelAdapter  # noqa: E402
 from src.core.config import settings  # noqa: E402
@@ -154,9 +154,9 @@ def main() -> None:
     args = parser.parse_args()
 
     embedder = ModelAdapter(
-        vector_size=settings.VECTOR_SIZE,
-        use_mock=settings.USE_MOCK_EMBEDDER,
-        model_name=settings.EMBEDDER_MODEL_NAME,
+        vector_size=settings.vector_size,
+        use_mock=settings.use_mock_embedder,
+        model_name=settings.model_name,
     )
     qdrant_proc = find_qdrant_process()
     ram_available = qdrant_proc is not None
@@ -166,10 +166,10 @@ def main() -> None:
         print("[warn] Процесс Qdrant не обнаружен локально средствами psutil.")
 
     flat_stats = run_benchmark(
-        "dota2_flat", settings.COLLECTION_FLAT, True, args.requests, embedder, qdrant_proc
+        "dota2_flat", settings.collection_flat, True, args.requests, embedder, qdrant_proc
     )
     quant_stats = run_benchmark(
-        "dota2_quantized", settings.COLLECTION_QUANTIZED, False, args.requests, embedder, qdrant_proc
+        "dota2_quantized", settings.collection_quantized, False, args.requests, embedder, qdrant_proc
     )
 
     print_report(flat_stats, quant_stats, ram_available)
@@ -177,3 +177,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

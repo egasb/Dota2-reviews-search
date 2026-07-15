@@ -32,21 +32,44 @@ app = FastAPI(
 
 # Единственный экземпляр адаптера модели на весь процесс API.
 embedder = ModelAdapter(
-    vector_size=settings.VECTOR_SIZE,
-    use_mock=settings.USE_MOCK_EMBEDDER,
-    model_name=settings.EMBEDDER_MODEL_NAME,
+    vector_size=settings.vector_size,
+    use_mock=settings.use_mock_embedder,
+    model_name=settings.model_name,
 )
 
 COLLECTION_MAP = {
-    "flat": settings.COLLECTION_FLAT,
-    "quantized": settings.COLLECTION_QUANTIZED,
+    "flat": settings.collection_flat,
+    "quantized": settings.collection_quantized,
 }
 
 
 @app.on_event("startup")
 def on_startup() -> None:
-    """Гарантируем, что обе коллекции существуют к моменту первого запроса."""
-    ensure_collections()
+    """
+    Гарантируем, что обе коллекции существуют к моменту первого запроса.
+
+    У образа qdrant/qdrant нет надёжного встроенного healthcheck-инструмента
+    (curl/wget намеренно убраны из образа, см. issue qdrant/qdrant#4250),
+    поэтому в docker-compose.yml зависимость api от qdrant ослаблена до
+    condition: service_started — контейнер Qdrant мог формально запуститься,
+    но ещё не успеть открыть порт. Ждём готовности здесь, на уровне
+    приложения, с повторными попытками.
+    """
+    max_attempts = 30
+    delay_seconds = 2.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            ensure_collections()
+            return
+        except Exception as exc:  # noqa: BLE001
+            if attempt == max_attempts:
+                raise RuntimeError(
+                    f"Qdrant не стал доступен за {max_attempts * delay_seconds:.0f} секунд: {exc}"
+                ) from exc
+            print(
+                f"[startup] Qdrant пока недоступен (попытка {attempt}/{max_attempts}): {exc}"
+            )
+            time.sleep(delay_seconds)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -109,3 +132,4 @@ def search_reviews(request: SearchRequest) -> SearchResponse:
         total_results=len(results),
         results=results,
     )
+
