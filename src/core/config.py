@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     # False -> Загружает реальную sentence-transformers модель.
     use_mock_embedder: bool = True
     model_name: str = "intfloat/multilingual-e5-small"
-    batch_size: int = 1024
+    batch_size: int = 256
 
     # --- Структура путей к данным ---
     raw_file: Path = DATA_DIR / "raw" / "reviews.jsonl"
