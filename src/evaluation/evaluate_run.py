@@ -69,6 +69,6 @@ def evaluate(run_file_path: Path) -> None:
 
 if __name__ == "__main__":
     safe_model_name = settings.model_name.replace("/", "_")
-    target_run = settings.vectors_file.parent / f"run_{safe_model_name}.json"
+    target_run = settings.vectors_file.parent / f"run_hybrid_{safe_model_name}.json"
 
     evaluate(target_run)
